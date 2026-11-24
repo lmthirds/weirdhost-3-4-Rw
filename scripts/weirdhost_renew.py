@@ -29,6 +29,7 @@ except ImportError:
 sys.stdout.reconfigure(line_buffering=True)
 
 BASE_URL = "https://hub.weirdhost.xyz/server/"
+LOGIN_URL = "https://hub.weirdhost.xyz/auth/login"
 API_BASE_URL = "https://hub.weirdhost.xyz/api/client"
 DOMAIN = "hub.weirdhost.xyz"
 MAX_COOKIE_COUNT = 10
@@ -645,10 +646,10 @@ def get_proxy_for_account(account_index, proxy_pool):
 
 
 # ============================================================
-#  账号自动检测
+#  账号自动检测（支持 Cookie 优先 + 邮箱密码自动兜底）
 # ============================================================
 
-def parse_account_config(raw_value):
+def parse_cookie_config(raw_value):
     if not raw_value:
         return None
     raw_value = raw_value.strip()
@@ -679,6 +680,36 @@ def parse_account_config(raw_value):
     }
 
 
+def parse_account_credentials(raw_value):
+    """解析 WEIRDHOST_ACCOUNT_N，支持 '邮箱-----密码' 或 '备注-----邮箱-----密码'"""
+    if not raw_value:
+        return None
+    raw_value = raw_value.strip()
+    if "-----" not in raw_value:
+        return None
+
+    parts = [p.strip() for p in raw_value.split("-----")]
+    if len(parts) >= 3:
+        remark = parts[0]
+        email = parts[1]
+        password = "-----".join(parts[2:])
+    elif len(parts) == 2:
+        remark = ""
+        email = parts[0]
+        password = parts[1]
+    else:
+        return None
+
+    if not email or not password:
+        return None
+
+    return {
+        "remark": remark,
+        "login_email": email,
+        "login_password": password,
+    }
+
+
 def detect_accounts():
     accounts = []
     proxy_pool = load_proxy_pool()
@@ -686,30 +717,54 @@ def detect_accounts():
         print(f"[INFO] 检测到公共节点池 PROXY_NODES: 共 {len(proxy_pool)} 个节点")
 
     for i in range(1, MAX_COOKIE_COUNT + 1):
-        env_name = f"WEIRDHOST_COOKIE_{i}"
-        raw = os.environ.get(env_name, "").strip()
-        if not raw:
+        cookie_env = f"WEIRDHOST_COOKIE_{i}"
+        account_env = f"WEIRDHOST_ACCOUNT_{i}"
+        raw_cookie = os.environ.get(cookie_env, "").strip()
+        raw_account = os.environ.get(account_env, "").strip()
+
+        if not raw_cookie and not raw_account:
             continue
 
-        config = parse_account_config(raw)
-        if not config:
-            print(f"[WARN] {env_name} 格式错误，跳过")
-            print("       正确格式: 备注-----remember_web_xxx=yyy")
+        cookie_cfg = parse_cookie_config(raw_cookie) if raw_cookie else None
+        if raw_cookie and not cookie_cfg:
+            print(f"[WARN] {cookie_env} 格式错误，将忽略该 Cookie")
+
+        cred_cfg = parse_account_credentials(raw_account) if raw_account else None
+        if raw_account and not cred_cfg:
+            print(f"[WARN] {account_env} 格式错误（正确格式: 邮箱-----密码 或 备注-----邮箱-----密码）")
+
+        if not cookie_cfg and not cred_cfg:
             continue
 
-        remark = config["remark"] or f"账号{i}"
+        remark = (
+            (cred_cfg["remark"] if cred_cfg and cred_cfg["remark"] else "")
+            or (cookie_cfg["remark"] if cookie_cfg and cookie_cfg["remark"] else "")
+            or (cred_cfg["login_email"] if cred_cfg else "")
+            or f"账号{i}"
+        )
+
+        if cookie_cfg and cred_cfg:
+            auth_mode = "Cookie优先 + 账密兜底"
+        elif cred_cfg:
+            auth_mode = "邮箱密码登录"
+        else:
+            auth_mode = "仅Cookie"
+
         proxy_uri, proxy_source = get_proxy_for_account(i, proxy_pool)
         proxy_hint = f" | 代理: {proxy_source}" if proxy_uri else " | 代理: 直连"
-        print(f"[INFO] 检测到 {env_name}: {mask_remark(remark)}{proxy_hint}")
+        print(f"[INFO] 检测到账号 [{i}]: {mask_remark(remark)} | 模式: {auth_mode}{proxy_hint}")
 
         accounts.append({
             "index": i,
-            "cookie_env": env_name,
+            "cookie_env": cookie_env,
+            "account_env": account_env,
             "remark": remark,
-            "cookie_str": config["cookie_str"],
-            "cookie_name": config["cookie_name"],
-            "cookie_value": config["cookie_value"],
-            "raw_cookie_value": config["raw_cookie_value"],
+            "cookie_str": cookie_cfg["cookie_str"] if cookie_cfg else "",
+            "cookie_name": cookie_cfg["cookie_name"] if cookie_cfg else "",
+            "cookie_value": cookie_cfg["cookie_value"] if cookie_cfg else "",
+            "raw_cookie_value": cookie_cfg["raw_cookie_value"] if cookie_cfg else "",
+            "login_email": cred_cfg["login_email"] if cred_cfg else "",
+            "login_password": cred_cfg["login_password"] if cred_cfg else "",
             "proxy_uri": proxy_uri,
             "proxy_source": proxy_source,
         })
@@ -772,7 +827,7 @@ def sync_tg_notify_photo(photo_path, caption=""):
 
 
 # ============================================================
-#  GitHub Secret
+#  GitHub Secret 自动回写
 # ============================================================
 
 def encrypt_secret(public_key, secret_value):
@@ -866,8 +921,23 @@ def get_cookies_normalized(sb):
     return normalized
 
 
+def get_remember_cookie_from_browser(sb):
+    """提取浏览器当前最新的 (cookie_name, decoded_value, raw_value)"""
+    try:
+        for c in get_cookies_normalized(sb):
+            name = c.get("name", "")
+            raw_val = c.get("value", "")
+            if name.startswith("remember_web") and raw_val:
+                return name, unquote(raw_val), raw_val
+    except Exception:
+        pass
+    return None, None, None
+
+
 def inject_cookie_cdp(sb, cookie_name, cookie_value, domain=DOMAIN):
-    """使用已验证可用的 document.cookie 注入到当前临时浏览器（不修改 GitHub Secrets）"""
+    """使用 document.cookie 注入到当前临时浏览器"""
+    if not cookie_name or not cookie_value:
+        return False
     cdp_js(
         sb,
         """
@@ -1039,6 +1109,248 @@ def cdp_click_xpath(sb, xpath):
 
 
 # ============================================================
+#  邮箱 + 密码自动登录（CDP 原生输入 + React 受控表单兼容）
+# ============================================================
+
+def _set_react_input_value(sb, css_selector, value):
+    """兼容 React 受控输入框的原生 value setter 兜底"""
+    return bool(cdp_js(
+        sb,
+        """
+        var el = document.querySelector(arguments[0]);
+        if (!el) return false;
+        el.focus();
+        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(el, arguments[1]);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return el.value === arguments[1];
+        """,
+        css_selector,
+        value,
+    ))
+
+
+def _fill_input_humanlike(sb, css_selector, value):
+    """优先用 CDP 原生键入（对 reCAPTCHA v3 友好），若未写入再走 React setter 兜底"""
+    try:
+        cdp_js(
+            sb,
+            """
+            var el = document.querySelector(arguments[0]);
+            if (el) { el.focus(); el.select && el.select(); }
+            """,
+            css_selector,
+        )
+        sb.cdp.click(css_selector)
+        cdp_sleep(sb, random.uniform(0.2, 0.45))
+        if hasattr(sb.cdp, "type"):
+            sb.cdp.type(css_selector, value)
+        elif hasattr(sb.cdp, "press_keys"):
+            sb.cdp.press_keys(css_selector, value)
+        else:
+            _set_react_input_value(sb, css_selector, value)
+    except Exception:
+        _set_react_input_value(sb, css_selector, value)
+
+    cdp_sleep(sb, 0.3)
+    actual = cdp_js(
+        sb,
+        "var el = document.querySelector(arguments[0]); return el ? el.value : '';",
+        css_selector,
+    )
+    if actual != value:
+        _set_react_input_value(sb, css_selector, value)
+        actual = cdp_js(
+            sb,
+            "var el = document.querySelector(arguments[0]); return el ? el.value : '';",
+            css_selector,
+        )
+    return actual == value
+
+
+def _detect_login_selectors(sb):
+    """探测登录页的账号框、密码框、提交按钮选择器"""
+    return cdp_js(
+        sb,
+        """
+        function pick(list) {
+            for (var i = 0; i < list.length; i++) {
+                var el = document.querySelector(list[i]);
+                if (el && el.offsetParent !== null) return list[i];
+            }
+            return null;
+        }
+        var userSel = pick([
+            'input[name="username"]',
+            'input[name="email"]',
+            'input[type="email"]',
+            'input[autocomplete="username"]',
+            'form input[type="text"]',
+            'input:not([type="password"]):not([type="hidden"]):not([type="checkbox"])'
+        ]);
+        var passSel = pick([
+            'input[name="password"]',
+            'input[type="password"]'
+        ]);
+        var btnSel = pick([
+            'form button[type="submit"]',
+            'button[type="submit"]'
+        ]);
+        return { user: userSel, pass: passSel, submit: btnSel };
+        """
+    ) or {}
+
+
+def _get_login_error_text(sb):
+    """提取登录页可能弹出的错误提示文案"""
+    try:
+        return cdp_js(
+            sb,
+            """
+            var selectors = [
+                '[role="alert"]',
+                '.alert-danger',
+                '.alert-error',
+                '[class*="Alert"]',
+                '[class*="Error"]',
+                '[class*="error"]'
+            ];
+            var msgs = [];
+            for (var s = 0; s < selectors.length; s++) {
+                var nodes = document.querySelectorAll(selectors[s]);
+                for (var i = 0; i < nodes.length; i++) {
+                    var t = (nodes[i].innerText || '').trim();
+                    if (t && t.length > 2 && t.length < 220 && !msgs.includes(t)) {
+                        msgs.push(t);
+                    }
+                }
+            }
+            return msgs.join(' | ');
+            """
+        ) or ""
+    except Exception:
+        return ""
+
+
+def login_with_credentials_cdp(sb, email, password, acc_prefix):
+    """在 CDP 模式下通过邮箱 + 密码登录 Weirdhost，返回 (ok: bool, message: str)"""
+    print(f"[INFO]   使用邮箱密码登录: {mask_email(email)}...")
+    cur_url = (sb.cdp.get_current_url() or "").lower()
+    if "/auth/login" not in cur_url:
+        cdp_open(sb, LOGIN_URL, wait=4)
+    else:
+        cdp_sleep(sb, 1.5)
+
+    if is_cf_challenge(sb):
+        print("[INFO]   登录页触发 CF 验证，正在处理...")
+        if not handle_turnstile(sb, target_url=LOGIN_URL, screenshot_prefix=acc_prefix):
+            return False, "登录页 Cloudflare 验证未通过"
+        cdp_sleep(sb, 2)
+
+    # 等待登录表单渲染
+    selectors = {}
+    for _ in range(12):
+        selectors = _detect_login_selectors(sb)
+        if selectors.get("user") and selectors.get("pass"):
+            break
+        cdp_sleep(sb, 1)
+
+    if not selectors.get("user") or not selectors.get("pass"):
+        return False, "未找到登录页账号或密码输入框"
+
+    if not _fill_input_humanlike(sb, selectors["user"], email):
+        return False, "填写账号邮箱失败"
+    cdp_sleep(sb, random.uniform(0.4, 0.9))
+
+    if not _fill_input_humanlike(sb, selectors["pass"], password):
+        return False, "填写账号密码失败"
+    cdp_sleep(sb, random.uniform(0.8, 1.5))
+
+    # 如果页面有“记住登录”勾选框则顺便勾选
+    try:
+        cdp_js(
+            sb,
+            """
+            var cb = document.querySelector('input[type="checkbox"]');
+            if (cb && !cb.checked) cb.click();
+            """
+        )
+    except Exception:
+        pass
+
+    # 点击登录按钮（优先 CDP 原生点击，失败则 JS 点击）
+    submit_sel = selectors.get("submit")
+    clicked = False
+    if submit_sel:
+        try:
+            sb.cdp.click(submit_sel)
+            clicked = True
+        except Exception:
+            clicked = bool(cdp_js(
+                sb,
+                "var b = document.querySelector(arguments[0]); if (b) { b.click(); return true; } return false;",
+                submit_sel,
+            ))
+    if not clicked:
+        clicked = bool(cdp_js(
+            sb,
+            """
+            var btns = document.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {
+                var t = (btns[i].innerText || '').trim().toLowerCase();
+                if (t === 'login' || t === 'sign in' || t.includes('로그인')) {
+                    btns[i].click();
+                    return true;
+                }
+            }
+            return false;
+            """
+        ))
+
+    if not clicked:
+        return False, "未找到可点击的登录按钮"
+
+    print("[INFO]   已提交账号密码，等待跳转至面板...")
+
+    # 轮询等待登录跳转（最多 24 秒）
+    for sec in range(1, 25):
+        cdp_sleep(sb, 1)
+
+        if is_cf_challenge(sb):
+            print("[INFO]   提交登录后遇到 CF 验证，正在处理...")
+            if not handle_turnstile(sb, target_url=f"https://{DOMAIN}/", screenshot_prefix=acc_prefix):
+                return False, "登录后 Cloudflare 验证未通过"
+            cdp_sleep(sb, 2)
+
+        if is_logged_in(sb, allow_api_check=(sec >= 4)):
+            return True, "账密登录成功"
+
+        # 检查是否停留在 2FA 或报错提示
+        cur_url = (sb.cdp.get_current_url() or "").lower()
+        if "/checkpoint" in cur_url or "/2fa" in cur_url:
+            return False, "该账号开启了二步验证 (2FA)，无法自动账密登录"
+
+        if sec >= 4 and "/auth/login" in cur_url:
+            err_msg = _get_login_error_text(sb)
+            if err_msg:
+                return False, f"账密登录被拒: {err_msg}"
+
+    # 兜底主动访问一次首页确认是否其实已经拿到 Session
+    cdp_open(sb, f"https://{DOMAIN}/", wait=4)
+    if is_cf_challenge(sb):
+        handle_turnstile(sb, target_url=f"https://{DOMAIN}/", screenshot_prefix=acc_prefix)
+        cdp_sleep(sb, 2)
+    if is_logged_in(sb):
+        return True, "账密登录成功"
+
+    err_msg = _get_login_error_text(sb)
+    if err_msg:
+        return False, f"账密登录失败: {err_msg}"
+    return False, f"账密登录超时未跳转（可能密码错误或触发了登录页 reCAPTCHA，URL: {sb.cdp.get_current_url()}）"
+
+
+# ============================================================
 #  服务器电源状态检测与离线/休眠自动开机
 # ============================================================
 
@@ -1189,7 +1501,6 @@ def ensure_server_online(sb, server_id, xsrf_token=None):
         print(f"  [WARN] 无法确认服务器状态 ({state})，跳过自动开机")
         return {"state": state, "action": "unknown", "label": f"❓ 未知({state})"}
 
-    # 状态为 offline / hibernating -> 先等待 Start 按钮就绪并点击
     print(f"  [INFO] 服务器处于 {state}，等待控制台 Start 按钮就绪并点击开机...")
     clicked, last_dom = wait_and_click_start_button(sb, timeout=15)
     if clicked:
@@ -1203,7 +1514,6 @@ def ensure_server_online(sb, server_id, xsrf_token=None):
         sb_info = last_dom.get("start", {})
         print(f"  [WARN] 15 秒内未点击到可用 Start 按钮 (found={sb_info.get('found')}, disabled={sb_info.get('disabled')})，尝试 API 兜底开机...")
 
-    # API 兜底开机
     if server_id and server_id != "Unknown":
         post_res = api_post_json(
             sb,
@@ -1944,28 +2254,31 @@ def is_logged_in(sb, allow_api_check=True):
         return False
 
 
-def check_and_update_cookie(sb, cookie_env, original_cookie_value, remark=""):
-    """检查 Cookie 是否变化；返回 (updated: bool, latest_decoded_val: str, latest_raw_val: str)"""
+def check_and_update_cookie(sb, cookie_env, original_cookie_value, remark="", force=False):
+    """检查 Cookie 是否变化并回写到 GitHub Secrets；返回 (updated, latest_name, latest_decoded, latest_raw)"""
     try:
-        for cookie in get_cookies_normalized(sb):
-            if cookie.get("name", "").startswith("remember_web"):
-                raw_new_val = cookie.get("value", "")
-                decoded_new_val = unquote(raw_new_val)
-                c_name = cookie.get("name", "")
-                if decoded_new_val and decoded_new_val != original_cookie_value:
-                    new_cookie_str = f"{c_name}={raw_new_val}"
-                    new_secret_value = f"{remark}-----{new_cookie_str}" if remark else new_cookie_str
-                    print(f"[INFO]   Cookie 已变化，更新 {cookie_env}...")
-                    if asyncio.run(update_github_secret(cookie_env, new_secret_value)):
-                        print(f"[INFO]   ✅ {cookie_env} 已更新")
-                        return True, decoded_new_val, raw_new_val
-                    else:
-                        print(f"[ERROR]  ❌ {cookie_env} 更新失败")
-                        return False, original_cookie_value, raw_new_val
-                break
+        c_name, decoded_new_val, raw_new_val = get_remember_cookie_from_browser(sb)
+        if not c_name or not decoded_new_val:
+            return False, None, original_cookie_value, None
+
+        if force or decoded_new_val != (original_cookie_value or ""):
+            new_cookie_str = f"{c_name}={raw_new_val}"
+            new_secret_value = f"{remark}-----{new_cookie_str}" if remark else new_cookie_str
+            if not os.environ.get("REPO_TOKEN", "").strip():
+                print(f"[INFO]   检测到新 Cookie，但未配置 REPO_TOKEN，跳过自动回写 {cookie_env}")
+                return False, c_name, decoded_new_val, raw_new_val
+            print(f"[INFO]   同步最新 Cookie 到 GitHub Secret ({cookie_env})...")
+            if asyncio.run(update_github_secret(cookie_env, new_secret_value)):
+                print(f"[INFO]   ✅ {cookie_env} 已自动更新")
+                return True, c_name, decoded_new_val, raw_new_val
+            else:
+                print(f"[WARN]   ⚠️ {cookie_env} 回写失败（请检查 REPO_TOKEN 是否有 Secrets 写入权限）")
+                return False, c_name, decoded_new_val, raw_new_val
+
+        return False, c_name, decoded_new_val, raw_new_val
     except Exception as e:
         print(f"[ERROR]  Cookie 检查失败: {e}")
-    return False, original_cookie_value, None
+        return False, None, original_cookie_value, None
 
 
 # ============================================================
@@ -1992,6 +2305,7 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, raw_cookie
         "message": "",
         "screenshot": None,
         "cookie_updated": False,
+        "latest_cookie_name": cookie_name,
         "latest_cookie_value": cookie_value,
         "latest_raw_cookie_value": raw_cookie_value,
     }
@@ -2011,7 +2325,7 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, raw_cookie
             handle_turnstile(sb, target_url=server_url, screenshot_prefix=screenshot_prefix)
             cdp_sleep(sb, 2)
 
-        if not is_logged_in(sb):
+        if not is_logged_in(sb) and cookie_name and raw_cookie_value:
             inject_cookie_cdp(sb, cookie_name, raw_cookie_value, DOMAIN)
             cdp_open(sb, server_url, wait=5)
             if is_cf_challenge(sb):
@@ -2097,12 +2411,17 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, raw_cookie
             srv_result.update(status=popup_result["status"], message=popup_result.get("message", "未知"))
             print(f"  [WARN] 结果: {popup_result['status']}")
 
-        updated, latest_val, latest_raw = check_and_update_cookie(sb, cookie_env, cookie_value, remark)
+        updated, latest_name, latest_val, latest_raw = check_and_update_cookie(
+            sb, cookie_env, cookie_value, remark
+        )
         if updated:
             srv_result["cookie_updated"] = True
+        if latest_name:
+            srv_result["latest_cookie_name"] = latest_name
+        if latest_val:
             srv_result["latest_cookie_value"] = latest_val
-            if latest_raw:
-                srv_result["latest_raw_cookie_value"] = latest_raw
+        if latest_raw:
+            srv_result["latest_raw_cookie_value"] = latest_raw
 
         if not srv_result["screenshot"] or not os.path.exists(srv_result["screenshot"]):
             final_ss = f"{screenshot_prefix}_final.png"
@@ -2122,7 +2441,7 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, raw_cookie
 
 
 # ============================================================
-#  单个账号处理（纯 CDP Mode）
+#  单个账号处理（Cookie 优先 + 邮箱密码自动重登兜底）
 # ============================================================
 
 def _try_login_with_cookie(sb, cookie_name, val_to_inject, home_url, acc_prefix, tag="原始值"):
@@ -2154,16 +2473,19 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
     cookie_name = account.get("cookie_name", "")
     cookie_value = account.get("cookie_value", "")
     raw_cookie_value = account.get("raw_cookie_value", cookie_value)
+    login_email = account.get("login_email", "")
+    login_password = account.get("login_password", "")
     acc_prefix = f"acc{account_index + 1}"
 
     result = {
         "remark": remark,
         "cookie_env": cookie_env,
-        "email": "Unknown",
+        "email": login_email or "Unknown",
         "status": "unknown",
         "message": "",
         "servers": [],
         "cookie_updated": False,
+        "login_method": "",
         "proxy_desc": proxy_desc,
         "screenshot": None,
     }
@@ -2189,15 +2511,42 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
 
     print(f"[INFO] ✅ 已离开 CF 验证页 | URL: {sb.cdp.get_current_url()} | Title: {sb.cdp.get_title()}")
 
-    print("[INFO] [步骤2] 注入 Cookie 并登录...")
+    # Step 2: Cookie 优先 + 邮箱密码自动重登兜底
+    print("[INFO] [步骤2] 执行登录...")
+    login_state = "not_logged_in"
+    active_cookie_name = cookie_name
+    active_cookie_value = cookie_value
     active_raw_cookie = raw_cookie_value
-    login_state = _try_login_with_cookie(sb, cookie_name, raw_cookie_value, home_url, acc_prefix, tag="原始值")
+    logged_in_by_password = False
 
-    if login_state == "not_logged_in" and cookie_value != raw_cookie_value:
-        print("[WARN]   原始值未登录，尝试使用 URL 解码值重新注入...")
-        login_state = _try_login_with_cookie(sb, cookie_name, cookie_value, home_url, acc_prefix, tag="解码值")
+    if cookie_name and raw_cookie_value:
+        login_state = _try_login_with_cookie(sb, cookie_name, raw_cookie_value, home_url, acc_prefix, tag="原始值")
+        if login_state == "not_logged_in" and cookie_value != raw_cookie_value:
+            print("[WARN]   原始值未登录，尝试使用 URL 解码值重新注入...")
+            login_state = _try_login_with_cookie(sb, cookie_name, cookie_value, home_url, acc_prefix, tag="解码值")
+            if login_state == "ok":
+                active_raw_cookie = cookie_value
         if login_state == "ok":
-            active_raw_cookie = cookie_value
+            result["login_method"] = "Cookie"
+    else:
+        print("[INFO]   未配置 Cookie，直接使用邮箱密码登录...")
+
+    if login_state == "not_logged_in" and login_email and login_password:
+        if cookie_name:
+            print("[WARN]   Cookie 已失效，自动切换为邮箱密码重登兜底...")
+        ok, cred_msg = login_with_credentials_cdp(sb, login_email, login_password, acc_prefix)
+        if ok:
+            login_state = "ok"
+            logged_in_by_password = True
+            result["login_method"] = "邮箱密码(自动重登)" if cookie_name else "邮箱密码"
+        else:
+            print(f"[ERROR]  {cred_msg}")
+            ss_path = f"{acc_prefix}_login_fail.png"
+            if safe_screenshot(sb, ss_path):
+                result["screenshot"] = ss_path
+            result["status"] = "error"
+            result["message"] = cred_msg
+            return result
 
     if login_state == "cf_blocked":
         result["status"] = "error"
@@ -2218,12 +2567,29 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
             result["message"] = "仍被 Cloudflare 验证拦截（非 Cookie 失效）"
         else:
             result["status"] = "cookie_invalid"
-            result["message"] = f"Cookie 已失效，请重新获取并更新 {cookie_env} (URL: {cur_url} | Title: {cur_title})"
+            result["message"] = (
+                f"Cookie 已失效且未配置 {account.get('account_env')} 账密兜底 "
+                f"(URL: {cur_url} | Title: {cur_title})"
+            )
         return result
 
     xsrf_token = get_xsrf_token_from_cookies(sb)
-    print(f"[INFO] ✅ 登录成功 | URL: {sb.cdp.get_current_url()} | Title: {sb.cdp.get_title()}")
+    print(f"[INFO] ✅ 登录成功 ({result['login_method']}) | URL: {sb.cdp.get_current_url()} | Title: {sb.cdp.get_title()}")
 
+    # 登录成功后立即检查并回写最新 Cookie（即使服务器处于冷却期也能保持 Secrets 最新）
+    updated, latest_name, latest_val, latest_raw = check_and_update_cookie(
+        sb, cookie_env, active_cookie_value, remark, force=logged_in_by_password
+    )
+    if updated:
+        result["cookie_updated"] = True
+    if latest_name:
+        active_cookie_name = latest_name
+    if latest_val:
+        active_cookie_value = latest_val
+    if latest_raw:
+        active_raw_cookie = latest_raw
+
+    # Step 3: 获取账号与服务器列表
     print("[INFO] [步骤3] 获取账号信息...")
     server_data = api_fetch_json(sb, f"{API_BASE_URL}?page=1", xsrf_token)
     if not server_data or server_data.get("error") == "unauthorized":
@@ -2245,7 +2611,7 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
                 email = actor.get("attributes", {}).get("email")
                 if email:
                     break
-    result["email"] = email or "Unknown"
+    result["email"] = email or login_email or "Unknown"
 
     servers = []
     for s in server_data.get("data", []):
@@ -2270,8 +2636,8 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
 
     result["servers"] = servers
 
-    if email and email != "Unknown":
-        print(f"[INFO] 邮箱: {mask_email(email)}")
+    if result["email"] != "Unknown":
+        print(f"[INFO] 邮箱: {mask_email(result['email'])}")
 
     if not servers:
         print("[WARN] 该账号下没有服务器")
@@ -2283,21 +2649,27 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
     for s in servers:
         print(f"  - {mask_server_id(s['identifier'])} [{s['server_type']}] {s['name']} | 到期: {s['expire']}")
 
+    # Step 4: 逐个处理服务器
     print("[INFO] [步骤4] 逐个处理服务器电源检测与续期...")
     server_results = []
-    current_cookie_value = cookie_value
+    current_cookie_name = active_cookie_name
+    current_cookie_value = active_cookie_value
     current_raw_cookie_value = active_raw_cookie
     for srv_idx, server in enumerate(servers):
         ss_prefix = f"{acc_prefix}_srv{srv_idx + 1}"
         srv_result = process_single_server(
-            sb, server, cookie_name, current_cookie_value, current_raw_cookie_value,
+            sb, server, current_cookie_name, current_cookie_value, current_raw_cookie_value,
             cookie_env, remark, ss_prefix
         )
         server_results.append(srv_result)
         if srv_result.get("cookie_updated"):
             result["cookie_updated"] = True
-            current_cookie_value = srv_result.get("latest_cookie_value", current_cookie_value)
-            current_raw_cookie_value = srv_result.get("latest_raw_cookie_value", current_raw_cookie_value)
+        if srv_result.get("latest_cookie_name"):
+            current_cookie_name = srv_result["latest_cookie_name"]
+        if srv_result.get("latest_cookie_value"):
+            current_cookie_value = srv_result["latest_cookie_value"]
+        if srv_result.get("latest_raw_cookie_value"):
+            current_raw_cookie_value = srv_result["latest_raw_cookie_value"]
         if srv_idx < len(servers) - 1:
             wait = random.randint(2, 4) if srv_result.get("status") == "skipped" else random.randint(5, 10)
             print(f"\n  [INFO] 等待 {wait} 秒后处理下一个服务器...")
@@ -2360,7 +2732,7 @@ def run_account_isolated(account, account_index):
                 return {
                     "remark": remark,
                     "cookie_env": cookie_env,
-                    "email": "Unknown",
+                    "email": account.get("login_email") or "Unknown",
                     "status": "error",
                     "message": f"代理启动失败且未启用直连回退: {info}",
                     "servers": [],
@@ -2397,7 +2769,7 @@ def run_account_isolated(account, account_index):
         account_result = {
             "remark": remark,
             "cookie_env": cookie_env,
-            "email": "Unknown",
+            "email": account.get("login_email") or "Unknown",
             "status": "error",
             "message": f"浏览器异常: {str(e)[:120]}",
             "servers": [],
@@ -2418,7 +2790,7 @@ def run_account_isolated(account, account_index):
         account_result = {
             "remark": remark,
             "cookie_env": cookie_env,
-            "email": "Unknown",
+            "email": account.get("login_email") or "Unknown",
             "status": "error",
             "message": "浏览器会话异常退出（未返回结果）",
             "servers": [],
@@ -2440,6 +2812,7 @@ def send_account_notification(result):
     email = result.get("email", "Unknown")
     remark = result.get("remark", "")
     cookie_updated = result.get("cookie_updated", False)
+    login_method = result.get("login_method", "")
     servers = result.get("servers", [])
     status = result.get("status", "unknown")
     proxy_desc = result.get("proxy_desc", "直连")
@@ -2449,9 +2822,11 @@ def send_account_notification(result):
         f"账号：{account_display}",
         f"出口：{html.escape(str(proxy_desc))}",
     ]
+    if login_method:
+        lines.append(f"登录：{html.escape(str(login_method))}")
 
     if status == "cookie_invalid":
-        lines.append(f"状态：⚠️ {html.escape(str(result.get('message', 'Cookie 已失效，请及时更新 WEIRDHOST_COOKIE_*')))}")
+        lines.append(f"状态：⚠️ {html.escape(str(result.get('message', 'Cookie 已失效，请更新或配置 WEIRDHOST_ACCOUNT_*')))}")
     elif status == "no_server":
         lines.append("状态：⚠️ 没有服务器")
     elif status == "error" and not servers:
@@ -2496,7 +2871,7 @@ def send_account_notification(result):
 
     if cookie_updated:
         lines.append("")
-        lines.append("🔑 Cookie 已自动更新")
+        lines.append("🔑 Cookie 已自动回写更新")
 
     lines.append("")
     lines.append("Weirdhost Auto Renew")
@@ -2533,22 +2908,22 @@ def add_server_time():
         print("\n" + "=" * 60)
         print("[ERROR] 未检测到任何有效的账号配置")
         print("=" * 60)
-        print("\n请在 GitHub Secrets 中设置 WEIRDHOST_COOKIE_1 ~ WEIRDHOST_COOKIE_5")
-        print("\n格式: 备注-----remember_web_xxx=yyy")
-        print("示例: 我的账号-----remember_web_59ba36addc2b2f940CCCC=XXXXXXXXXXX")
+        print("\n请在 GitHub Secrets 中设置以下任一配置:")
+        print("  1. WEIRDHOST_ACCOUNT_1 ~ 5  格式: 邮箱-----密码 或 备注-----邮箱-----密码")
+        print("  2. WEIRDHOST_COOKIE_1  ~ 5  格式: 备注-----remember_web_xxx=yyy")
         print("=" * 60)
 
         sync_tg_notify(
             "🔔 <b>Weirdhost 续期</b>\n\n"
-            "❌ 未检测到任何有效的 WEIRDHOST_COOKIE_N\n\n"
+            "❌ 未检测到任何有效的账号配置\n\n"
             "请在 GitHub Secrets 中设置:\n"
-            "<code>WEIRDHOST_COOKIE_1</code>\n"
-            "格式: <code>备注-----remember_web_xxx=yyy</code>"
+            "<code>WEIRDHOST_ACCOUNT_1</code> (<code>邮箱-----密码</code>)\n"
+            "或 <code>WEIRDHOST_COOKIE_1</code>"
         )
         return
 
     print("=" * 60)
-    print("[INFO] Weirdhost 多账号自动续期 (CDP Mode + sing-box 代理 + 离线自动开机)")
+    print("[INFO] Weirdhost 多账号自动续期 (CDP Mode + 账密兜底 + sing-box + 自动开机)")
     print(f"[INFO] 共 {len(accounts)} 个账号")
     print("=" * 60)
 
