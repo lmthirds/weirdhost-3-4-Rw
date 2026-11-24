@@ -543,7 +543,6 @@ class SingBoxProxyManager:
             self.stop()
             return False, f"sing-box 启动异常: {e}"
 
-        # 等待本地端口就绪
         port_ready = False
         for _ in range(30):
             if self.process.poll() is not None:
@@ -562,7 +561,6 @@ class SingBoxProxyManager:
             self.stop()
             return False, f"sing-box 本地端口监听超时: {err_out}"
 
-        # 连通性、出口 IP 与时区预检
         proxy_url = f"http://127.0.0.1:{self.local_port}"
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
@@ -1115,6 +1113,32 @@ def click_start_button_dom(sb):
         return False
 
 
+def wait_and_click_start_button(sb, timeout=15):
+    """等待 React 控制台 WebSocket 就绪、Start 按钮变为可点击后再点击"""
+    deadline = time.time() + timeout
+    last_dom = {}
+    while time.time() < deadline:
+        last_dom = get_power_dom_info(sb)
+        start_btn = last_dom.get("start", {})
+        if start_btn.get("found") and not start_btn.get("disabled"):
+            if click_start_button_dom(sb):
+                return True, last_dom
+        cdp_sleep(sb, 1)
+    return False, last_dom
+
+
+def poll_until_starting(sb, server_id, xsrf_token=None, timeout=18):
+    """开机指令发出后轮询状态，等待容器从 offline/수면중 切换到 starting 或 running"""
+    deadline = time.time() + timeout
+    latest_state = "offline"
+    while time.time() < deadline:
+        cdp_sleep(sb, 3)
+        latest_state, _ = detect_server_power_state(sb, server_id, xsrf_token)
+        if latest_state in ("running", "starting"):
+            return True, latest_state
+    return False, latest_state
+
+
 def detect_server_power_state(sb, server_id, xsrf_token=None):
     """综合 API 与 DOM（含 Weirdhost 休眠状态 수면중）判断服务器当前状态"""
     api_state = get_power_state_from_api(sb, server_id, xsrf_token)
@@ -1165,19 +1189,19 @@ def ensure_server_online(sb, server_id, xsrf_token=None):
         print(f"  [WARN] 无法确认服务器状态 ({state})，跳过自动开机")
         return {"state": state, "action": "unknown", "label": f"❓ 未知({state})"}
 
-    # 状态为 offline / hibernating -> 执行开机
-    print(f"  [INFO] 服务器处于 {state}，尝试点击 Start 按钮开机...")
-    clicked = click_start_button_dom(sb)
+    # 状态为 offline / hibernating -> 先等待 Start 按钮就绪并点击
+    print(f"  [INFO] 服务器处于 {state}，等待控制台 Start 按钮就绪并点击开机...")
+    clicked, last_dom = wait_and_click_start_button(sb, timeout=15)
     if clicked:
-        print("  [INFO] 已点击 Start 按钮，等待状态更新...")
-        cdp_sleep(sb, 5)
-        new_state, _ = detect_server_power_state(sb, server_id, xsrf_token)
-        if new_state in ("running", "starting"):
+        print("  [INFO] 已点击页面 Start 按钮，轮询等待状态更新（最多 18 秒）...")
+        ok, new_state = poll_until_starting(sb, server_id, xsrf_token, timeout=18)
+        if ok:
             print(f"  [INFO] ✅ 服务器开机成功（当前状态: {new_state}）")
             return {"state": new_state, "action": "started", "label": f"⚡ 已自动开机({new_state})"}
-        print(f"  [WARN] 点击 Start 后状态仍为 {new_state}，尝试 API 兜底开机...")
+        print(f"  [WARN] 点击 Start 后 18 秒状态仍为 {new_state}，尝试 API 兜底开机...")
     else:
-        print("  [WARN] 页面未点击到可用 Start 按钮，尝试 API 兜底开机...")
+        sb_info = last_dom.get("start", {})
+        print(f"  [WARN] 15 秒内未点击到可用 Start 按钮 (found={sb_info.get('found')}, disabled={sb_info.get('disabled')})，尝试 API 兜底开机...")
 
     # API 兜底开机
     if server_id and server_id != "Unknown":
@@ -1188,12 +1212,12 @@ def ensure_server_online(sb, server_id, xsrf_token=None):
             xsrf_token,
         )
         if isinstance(post_res, dict) and post_res.get("_ok"):
-            print("  [INFO] API 开机指令已发送，等待状态更新...")
-            cdp_sleep(sb, 5)
-            new_state, _ = detect_server_power_state(sb, server_id, xsrf_token)
-            if new_state in ("running", "starting"):
+            print("  [INFO] API 开机指令已发送，轮询等待状态更新（最多 18 秒）...")
+            ok, new_state = poll_until_starting(sb, server_id, xsrf_token, timeout=18)
+            if ok:
                 print(f"  [INFO] ✅ API 兜底开机成功（当前状态: {new_state}）")
                 return {"state": new_state, "action": "started", "label": f"⚡ 已自动开机({new_state})"}
+            print(f"  [WARN] API 开机指令已发送，但 18 秒后状态仍为 {new_state}")
             return {"state": new_state, "action": "start_sent", "label": f"⚡ 已发送开机({new_state})"}
 
     print(f"  [ERROR] ❌ 自动开机失败，服务器仍为 {state}")
@@ -1366,7 +1390,7 @@ def get_cf_challenge_checkbox_coords(sb):
                     var el = input.parentElement;
                     for (var j = 0; j < 6 && el; j++) {
                         var r = el.getBoundingClientRect();
-                        if (r.width >= 200 && r.height >= 45 && r.height <= 120) {
+                        if (r.width >= 200 && r.width <= 450 && r.height >= 45 && r.height <= 120) {
                             candidates.push(r);
                             break;
                         }
@@ -1575,33 +1599,57 @@ return 'done';
 
 
 def get_turnstile_checkbox_coords(sb):
+    """精准定位弹窗内 300x65 Turnstile 控件，限制高度上限避免误匹配整个弹窗"""
     try:
         return cdp_js(
             sb,
             """
+            var candidates = [];
             var iframes = document.querySelectorAll('iframe');
             for (var i = 0; i < iframes.length; i++) {
                 var src = iframes[i].src || '';
                 if (src.includes('cloudflare') || src.includes('turnstile')) {
-                    var rect = iframes[i].getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
-                        return {x:rect.x, y:rect.y, width:rect.width, height:rect.height,
-                                click_x:Math.round(rect.x+30), click_y:Math.round(rect.y+rect.height/2)};
+                    var r = iframes[i].getBoundingClientRect();
+                    if (r.width >= 200 && r.width <= 450 && r.height >= 45 && r.height <= 120) {
+                        candidates.push({rect: r, src: 'iframe'});
                     }
                 }
             }
-            var input = document.querySelector('input[name="cf-turnstile-response"]');
-            if (input) {
-                var container = input.parentElement;
-                for (var j = 0; j < 5; j++) {
-                    if (!container) break;
-                    var rect = container.getBoundingClientRect();
-                    if (rect.width > 100 && rect.height > 30) {
-                        return {x:rect.x, y:rect.y, width:rect.width, height:rect.height,
-                                click_x:Math.round(rect.x+30), click_y:Math.round(rect.y+rect.height/2)};
+            if (candidates.length === 0) {
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                if (input) {
+                    var el = input.parentElement;
+                    for (var j = 0; j < 6 && el; j++) {
+                        var r = el.getBoundingClientRect();
+                        if (r.width >= 200 && r.width <= 450 && r.height >= 45 && r.height <= 120) {
+                            candidates.push({rect: r, src: 'input-ancestor-' + j});
+                        }
+                        el = el.parentElement;
                     }
-                    container = container.parentElement;
                 }
+            }
+            if (candidates.length === 0) {
+                var divs = document.querySelectorAll('div');
+                for (var k = 0; k < divs.length; k++) {
+                    var r = divs[k].getBoundingClientRect();
+                    if (r.width >= 280 && r.width <= 330 && r.height >= 55 && r.height <= 80 && r.y > 40) {
+                        candidates.push({rect: r, src: 'div-300x65'});
+                    }
+                }
+            }
+            if (candidates.length > 0) {
+                candidates.sort(function(a, b) {
+                    return Math.abs(a.rect.width * a.rect.height - 19500) - Math.abs(b.rect.width * b.rect.height - 19500);
+                });
+                var best = candidates[0];
+                var r = best.rect;
+                return {
+                    x: Math.round(r.x), y: Math.round(r.y),
+                    width: Math.round(r.width), height: Math.round(r.height),
+                    src: best.src,
+                    click_x: Math.round(r.x + 28),
+                    click_y: Math.round(r.y + r.height / 2)
+                };
             }
             return null;
             """
@@ -1613,7 +1661,7 @@ def get_turnstile_checkbox_coords(sb):
 def click_turnstile_checkbox(sb):
     coords = get_turnstile_checkbox_coords(sb)
     if not coords:
-        print("[WARN] 无法获取 Turnstile 坐标")
+        print("[WARN]   无法获取弹窗 Turnstile 坐标")
         return False
     try:
         window_info = cdp_js(
@@ -1626,9 +1674,13 @@ def click_turnstile_checkbox(sb):
         chrome_bar_height = max(0, window_info["outerHeight"] - window_info["innerHeight"])
         abs_x = coords["click_x"] + window_info["screenX"]
         abs_y = coords["click_y"] + window_info["screenY"] + chrome_bar_height
+        print(
+            f"[INFO]   点击弹窗 Turnstile ({abs_x}, {abs_y}) "
+            f"[来源: {coords.get('src')}, 框: {coords.get('width')}x{coords.get('height')}]"
+        )
         return xdotool_click(abs_x, abs_y)
     except Exception as e:
-        print(f"[ERROR] 坐标计算失败: {e}")
+        print(f"[ERROR]  坐标计算失败: {e}")
         return False
 
 
@@ -1736,16 +1788,20 @@ def handle_renewal_popup(sb, screenshot_prefix="", timeout=90):
         if check_turnstile_solved_popup(sb):
             print("[INFO]   Turnstile 已通过!")
             break
+        if check_result_popup(sb) in ("success", "cooldown"):
+            break
         cdp_js(sb, EXPAND_POPUP_JS)
         cdp_sleep(sb, 0.3)
-        if attempt == 0:
+        if attempt in (0, 2):
             try:
-                call_sb_solve_captcha(sb)
-            except Exception:
+                method_name = call_sb_solve_captcha(sb)
+                print(f"[INFO]   [尝试{attempt + 1}] 已调用 {method_name}，等待 6s...")
+            except Exception as e:
+                print(f"[WARN]   [尝试{attempt + 1}] solve_captcha 异常({e})，回退坐标点击")
                 click_turnstile_checkbox(sb)
         else:
             click_turnstile_checkbox(sb)
-        cdp_sleep(sb, 5)
+        cdp_sleep(sb, 6)
         if check_turnstile_solved_popup(sb):
             print("[INFO]   Turnstile 已通过!")
             break
@@ -1950,14 +2006,14 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, raw_cookie
     print("  [INFO] 访问服务器页面...")
 
     try:
-        cdp_open(sb, server_url, wait=4)
+        cdp_open(sb, server_url, wait=5)
         if is_cf_challenge(sb):
             handle_turnstile(sb, target_url=server_url, screenshot_prefix=screenshot_prefix)
             cdp_sleep(sb, 2)
 
         if not is_logged_in(sb):
             inject_cookie_cdp(sb, cookie_name, raw_cookie_value, DOMAIN)
-            cdp_open(sb, server_url, wait=4)
+            cdp_open(sb, server_url, wait=5)
             if is_cf_challenge(sb):
                 handle_turnstile(sb, target_url=server_url, screenshot_prefix=screenshot_prefix)
                 cdp_sleep(sb, 2)
@@ -2118,7 +2174,6 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
         pass
     log_browser_env_pre_cdp(sb)
 
-    # 切入纯 CDP Mode（彻底脱离 ChromeDriver）
     home_url = f"https://{DOMAIN}/"
     print("[INFO] [步骤1] 启动 CDP Mode 访问站点并处理 Cloudflare 验证...")
     sb.activate_cdp_mode(home_url)
@@ -2134,7 +2189,6 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
 
     print(f"[INFO] ✅ 已离开 CF 验证页 | URL: {sb.cdp.get_current_url()} | Title: {sb.cdp.get_title()}")
 
-    # Step 2: 注入 Cookie 并登录
     print("[INFO] [步骤2] 注入 Cookie 并登录...")
     active_raw_cookie = raw_cookie_value
     login_state = _try_login_with_cookie(sb, cookie_name, raw_cookie_value, home_url, acc_prefix, tag="原始值")
@@ -2170,7 +2224,6 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
     xsrf_token = get_xsrf_token_from_cookies(sb)
     print(f"[INFO] ✅ 登录成功 | URL: {sb.cdp.get_current_url()} | Title: {sb.cdp.get_title()}")
 
-    # Step 3: 获取账号与服务器列表
     print("[INFO] [步骤3] 获取账号信息...")
     server_data = api_fetch_json(sb, f"{API_BASE_URL}?page=1", xsrf_token)
     if not server_data or server_data.get("error") == "unauthorized":
@@ -2230,7 +2283,6 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
     for s in servers:
         print(f"  - {mask_server_id(s['identifier'])} [{s['server_type']}] {s['name']} | 到期: {s['expire']}")
 
-    # Step 4: 逐个处理服务器
     print("[INFO] [步骤4] 逐个处理服务器电源检测与续期...")
     server_results = []
     current_cookie_value = cookie_value
