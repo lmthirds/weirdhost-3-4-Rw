@@ -26,7 +26,7 @@ jobs:
       - name: 安装系统依赖
         run: |
           sudo apt-get update -o Acquire::Retries=3
-          sudo apt-get install -y --no-install-recommends xvfb xdotool scrot python3-tk
+          sudo apt-get install -y --no-install-recommends xvfb xdotool scrot python3-tk fonts-nanum
 
       - name: 安装 sing-box
         run: |
@@ -45,6 +45,13 @@ jobs:
 
       - name: 运行续期脚本
         env:
+          # 邮箱密码兜底（格式：邮箱-----密码 或 备注-----邮箱-----密码）
+          WEIRDHOST_ACCOUNT_1: ${{ secrets.WEIRDHOST_ACCOUNT_1 }}
+          WEIRDHOST_ACCOUNT_2: ${{ secrets.WEIRDHOST_ACCOUNT_2 }}
+          WEIRDHOST_ACCOUNT_3: ${{ secrets.WEIRDHOST_ACCOUNT_3 }}
+          WEIRDHOST_ACCOUNT_4: ${{ secrets.WEIRDHOST_ACCOUNT_4 }}
+          WEIRDHOST_ACCOUNT_5: ${{ secrets.WEIRDHOST_ACCOUNT_5 }}
+          # Cookie 优先（可留空，配合 REPO_TOKEN 登录成功后自动回写）
           WEIRDHOST_COOKIE_1: ${{ secrets.WEIRDHOST_COOKIE_1 }}
           WEIRDHOST_COOKIE_2: ${{ secrets.WEIRDHOST_COOKIE_2 }}
           WEIRDHOST_COOKIE_3: ${{ secrets.WEIRDHOST_COOKIE_3 }}
